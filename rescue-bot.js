@@ -13,7 +13,10 @@
  */
 
 import 'dotenv/config';
-import { Wallet, providers, Contract } from 'ethers';
+const providerWS = new ethers.WebSocketProvider(RPC_WS);
+const providerHTTP = new ethers.JsonRpcProvider(RPC_HTTP);
+const wallet = new ethers.Wallet(PRIVATE_KEY, providerHTTP);
+const vault = new ethers.Contract(VAULT_ADDRESS, vaultAbi, wallet);
 
 // ---- CONFIG ----
 const {
