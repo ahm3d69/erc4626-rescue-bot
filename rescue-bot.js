@@ -36,7 +36,7 @@ if (!RPC_WS || !RPC_HTTP || !PRIVATE_KEY || !OWNER_ADDRESS || !VAULT_ADDRESS) {
 }
 
 const dryRun = DRY_RUN.toLowerCase() === 'true';
-const maxRetries = parseInt(MAX_RETRIES, 10);
+const maxRetries = parseInt(MAX_RETRIES, 3);
 const initialGasGwei = Number(INITIAL_GAS_GWEI);
 const maxGasGwei = Number(MAX_GAS_GWEI);
 const retryBaseMs = Number(RETRY_BASE_MS);
