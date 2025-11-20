@@ -1,3 +1,5 @@
+// Updated rescue-bot.js with Option A: redeem only available liquidity
+
 import 'dotenv/config';
 import { ethers } from 'ethers';
 
@@ -40,13 +42,9 @@ const ERC4626_ABI = [
   "function redeem(uint256 shares, address receiver, address owner) external returns (uint256)",
   "function maxRedeem(address owner) view returns (uint256)",
   "function balanceOf(address owner) view returns (uint256)",
+  "function convertToShares(uint256 assets) view returns (uint256)",
+  "function convertToAssets(uint256 shares) view returns (uint256)",
   "function decimals() view returns (uint8)"
-];
-
-const ERC20_ABI = [
-  "function balanceOf(address) view returns (uint256)",
-  "function decimals() view returns (uint8)",
-  "function symbol() view returns (string)"
 ];
 
 // ---------------------------------------------------------
@@ -61,10 +59,6 @@ const wallet = new ethers.Wallet(PRIVATE_KEY, httpProvider);
 // Contracts
 const vault = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, httpProvider);
 const vaultWs = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, wsProvider);
-
-const underlying = TOKEN_ADDRESS
-  ? new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, httpProvider)
-  : null;
 
 // ---------------------------------------------------------
 // Helpers
@@ -86,22 +80,18 @@ async function getSafeGasPrice(gweiPreferred) {
 }
 
 // ---------------------------------------------------------
-// Rescue Logic
+// Rescue Logic Option A: redeem exact available liquidity
 // ---------------------------------------------------------
 let rescueRunning = false;
 let rescueReason = "startup";
 
 async function triggerRescue(reason) {
-  if (rescueRunning) {
-    rescueReason = reason;
-    return;
-  }
-
+  if (rescueRunning) return;
   rescueRunning = true;
   rescueReason = reason;
 
   try {
-    await rescueLoop();
+    await rescueAvailableLiquidity();
   } catch (e) {
     console.error("RESCUE ERROR:", e);
   } finally {
@@ -109,58 +99,47 @@ async function triggerRescue(reason) {
   }
 }
 
-async function rescueLoop() {
+async function rescueAvailableLiquidity() {
   const signer = await wallet.getAddress();
   console.log(`\n--- Rescue triggered by: ${rescueReason} ---`);
 
-  let shares;
+  let maxShares;
   try {
-    shares = await vault.balanceOf(signer);
+    maxShares = await vault.maxRedeem(signer);
   } catch {
-    console.error("Cannot read vault shares");
+    console.error("Cannot read maxRedeem");
     return;
   }
 
-  if (shares === 0n) {
-    console.log("No shares => nothing to rescue");
+  if (maxShares === 0n) {
+    console.log("No liquidity available yet — waiting for next event");
     return;
   }
 
-  console.log(`Attempting to redeem: ${shares.toString()} shares`);
+  console.log(`Liquidity available! Trying redeem of ${maxShares.toString()} shares.`);
 
-  await attemptRedeemRepeated(shares);
+  await attemptRedeem(maxShares);
 }
 
-async function attemptRedeemRepeated(shares) {
+// ---------------------------------------------------------
+// Core redeem engine
+// ---------------------------------------------------------
+async function attemptRedeem(shares) {
   const signer = await wallet.getAddress();
-  let attempt = 0;
   let gasGwei = gasStart;
 
-  while (attempt < maxRetries) {
-    attempt++;
-
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // prepare calldata
       const data = vault.interface.encodeFunctionData("redeem", [
         shares,
         OWNER_ADDRESS,
         signer
       ]);
 
-      const callRequest = {
-        to: VAULT_ADDRESS,
-        data,
-        from: signer
-      };
+      const callRequest = { to: VAULT_ADDRESS, data, from: signer };
 
-      // simulate (safe)
-      try {
-        await httpProvider.call(callRequest);
-      } catch (e) {
-        // simulation error is okay—liquidity may be insufficient now
-      }
+      try { await httpProvider.call(callRequest); } catch {}
 
-      // estimate gas (best effort)
       let gasLimit;
       try {
         const est = await httpProvider.estimateGas(callRequest);
@@ -169,20 +148,14 @@ async function attemptRedeemRepeated(shares) {
         gasLimit = 600000n;
       }
 
-      // choose gas price
       let gasPrice = await getSafeGasPrice(gasGwei);
       const cap = BigInt(Math.floor(gasCap * 1e9));
       if (gasPrice > cap) gasPrice = cap;
 
-      const tx = {
-        to: VAULT_ADDRESS,
-        data,
-        gasLimit,
-        gasPrice
-      };
+      const tx = { to: VAULT_ADDRESS, data, gasLimit, gasPrice };
 
       if (dryRun) {
-        console.log(`[DRY RUN] Would send redeem tx with gasPrice ${gasPrice}`);
+        console.log(`[DRY RUN] Would redeem available shares: ${shares}`);
         return;
       }
 
@@ -195,7 +168,7 @@ async function attemptRedeemRepeated(shares) {
         return;
       }
 
-      console.warn("Redeem failed (not reverted), retrying...");
+      console.warn("Redeem failed — retrying...");
 
     } catch (err) {
       console.warn(`Attempt #${attempt} error: ${err.message}`);
@@ -203,12 +176,11 @@ async function attemptRedeemRepeated(shares) {
 
     const delay = retryBaseMs * Math.pow(1.8, attempt);
     console.log(`Retry ${attempt}/${maxRetries}, waiting ${delay}ms ...`);
-
     await sleep(delay);
     gasGwei = Math.min(gasCap, Math.round(gasGwei * 1.5));
   }
 
-  console.error("Max retries reached — rescue failed.");
+  console.error("Max retries reached — stopping rescue for this event.");
 }
 
 // ---------------------------------------------------------
@@ -219,11 +191,11 @@ async function attemptRedeemRepeated(shares) {
   console.log(`Running Rescue Bot for wallet: ${signer}`);
   console.log(`Vault: ${VAULT_ADDRESS}`);
 
-  // --- Event listeners ---
+  // Event-driven rescue
   vaultWs.on("Deposit", () => triggerRescue("Deposit"));
-  vaultWs.on("Withdraw", () => triggerRescue("Withdraw"));
   vaultWs.on("Transfer", () => triggerRescue("Transfer"));
+  vaultWs.on("Withdraw", () => triggerRescue("Withdraw"));
 
-  // initial rescue attempt
+  // First attempt on startup
   await triggerRescue("startup");
 })();
