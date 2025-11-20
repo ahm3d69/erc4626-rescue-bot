@@ -1,7 +1,9 @@
 import 'dotenv/config';
 import { ethers } from 'ethers';
 
-// ---------- Config (from .env) ----------
+// ---------------------------------------------------------
+// ENV VARS
+// ---------------------------------------------------------
 const {
   RPC_WS,
   RPC_HTTP,
@@ -17,27 +19,27 @@ const {
 } = process.env;
 
 if (!RPC_WS || !RPC_HTTP || !PRIVATE_KEY || !OWNER_ADDRESS || !VAULT_ADDRESS) {
-  console.error('Missing required env vars. Please set RPC_WS, RPC_HTTP, PRIVATE_KEY, OWNER_ADDRESS, VAULT_ADDRESS.');
+  console.error("Missing environment variables. Check .env");
   process.exit(1);
 }
 
-const dryRun = String(DRY_RUN).toLowerCase() === 'true';
+const dryRun = DRY_RUN.toLowerCase() === "true";
 const maxRetries = Number(MAX_RETRIES);
-let gasGweiStart = Number(INITIAL_GAS_GWEI);
-const gasGweiCap = Number(MAX_GAS_GWEI);
+const gasStart = Number(INITIAL_GAS_GWEI);
+const gasCap = Number(MAX_GAS_GWEI);
 const retryBaseMs = Number(RETRY_BASE_MS);
 
-// ---------- ABIs ----------
+// ---------------------------------------------------------
+// ABIs
+// ---------------------------------------------------------
 const ERC4626_ABI = [
   "event Deposit(address indexed caller, address indexed owner, uint256 assets, uint256 shares)",
   "event Withdraw(address indexed caller, address indexed receiver, uint256 assets, uint256 shares)",
-  "function maxWithdraw(address owner) external view returns (uint256)",
-  "function maxRedeem(address owner) external view returns (uint256)",
-  "function previewWithdraw(uint256 assets) external view returns (uint256)",
-  "function withdraw(uint256 assets, address receiver, address owner) external returns (uint256)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
+
   "function redeem(uint256 shares, address receiver, address owner) external returns (uint256)",
+  "function maxRedeem(address owner) view returns (uint256)",
   "function balanceOf(address owner) view returns (uint256)",
-  "function totalAssets() view returns (uint256)",
   "function decimals() view returns (uint8)"
 ];
 
@@ -47,145 +49,181 @@ const ERC20_ABI = [
   "function symbol() view returns (string)"
 ];
 
-// ---------- Providers & wallet (ethers v6) ----------
+// ---------------------------------------------------------
+// Providers
+// ---------------------------------------------------------
 const wsProvider = new ethers.WebSocketProvider(RPC_WS);
 const httpProvider = new ethers.JsonRpcProvider(RPC_HTTP);
+
+// wallet (signer)
 const wallet = new ethers.Wallet(PRIVATE_KEY, httpProvider);
 
-// ---------- Contracts ----------
+// Contracts
 const vault = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, httpProvider);
 const vaultWs = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, wsProvider);
-const underlying = TOKEN_ADDRESS ? new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, httpProvider) : null;
 
-// ---------- Helpers ----------
+const underlying = TOKEN_ADDRESS
+  ? new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, httpProvider)
+  : null;
+
+// ---------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-const toBigInt = (v) => (typeof v === 'bigint' ? v : BigInt(v?.toString?.() ?? 0));
-const formatWei = (bn, decimals = 18) => ethers.formatUnits(bn, decimals);
 
-async function currentGasPriceOrFallback(preferredGwei) {
+async function getSafeGasPrice(gweiPreferred) {
   try {
     const fee = await httpProvider.getFeeData();
     if (fee.maxFeePerGas) return fee.maxFeePerGas;
   } catch {}
+
   try {
     const gp = await httpProvider.getGasPrice();
     if (gp) return gp;
   } catch {}
-  return BigInt(Math.floor(preferredGwei * 1e9));
+
+  return BigInt(Math.floor(gweiPreferred * 1e9));
 }
 
-// ---------- Main ----------
-(async function main() {
-  const signer = await wallet.getAddress();
-  console.log(`Running Rescue Bot for: ${signer}`);
+// ---------------------------------------------------------
+// Rescue Logic
+// ---------------------------------------------------------
+let rescueRunning = false;
+let rescueReason = "startup";
 
-  wsProvider._websocket.on('open', () => console.log('WS connected.'));
-  wsProvider._websocket.on('close', () => {
-    console.error('WS closed. Exit.');
-    process.exit(1);
-  });
-
-  vaultWs.on('Deposit', () => triggerRescueAttempt('Deposit'));
-  vaultWs.on('Withdraw', () => triggerRescueAttempt('Withdraw'));
-  vaultWs.on('Transfer', () => triggerRescueAttempt('Transfer'));
-
-  await triggerRescueAttempt('startup');
-})();
-
-let rescueInProgress = false;
-let lastTriggerReason = null;
-
-async function triggerRescueAttempt(reason) {
-  if (rescueInProgress) {
-    lastTriggerReason = reason;
+async function triggerRescue(reason) {
+  if (rescueRunning) {
+    rescueReason = reason;
     return;
   }
-  rescueInProgress = true;
-  lastTriggerReason = reason;
+
+  rescueRunning = true;
+  rescueReason = reason;
 
   try {
-    await attemptRescueLoop();
+    await rescueLoop();
   } catch (e) {
-    console.error(e);
+    console.error("RESCUE ERROR:", e);
   } finally {
-    rescueInProgress = false;
+    rescueRunning = false;
   }
 }
 
-async function attemptRescueLoop() {
+async function rescueLoop() {
   const signer = await wallet.getAddress();
-  console.log(`--- Rescue triggered by: ${lastTriggerReason} ---`);
+  console.log(`\n--- Rescue triggered by: ${rescueReason} ---`);
 
-  let shares = 0n;
+  let shares;
   try {
     shares = await vault.balanceOf(signer);
-  } catch {}
-
-  if (shares === 0n) {
-    console.log("No vault shares to rescue.");
+  } catch {
+    console.error("Cannot read vault shares");
     return;
   }
 
-  console.log(`Attempting redeem of ${shares}`);
+  if (shares === 0n) {
+    console.log("No shares => nothing to rescue");
+    return;
+  }
 
-  await repeatedlyTryRedeem(shares);
+  console.log(`Attempting to redeem: ${shares.toString()} shares`);
+
+  await attemptRedeemRepeated(shares);
 }
 
-async function repeatedlyTryRedeem(shares) {
+async function attemptRedeemRepeated(shares) {
   const signer = await wallet.getAddress();
   let attempt = 0;
-  let gasGwei = gasGweiStart;
+  let gasGwei = gasStart;
 
   while (attempt < maxRetries) {
     attempt++;
 
     try {
+      // prepare calldata
       const data = vault.interface.encodeFunctionData("redeem", [
         shares,
         OWNER_ADDRESS,
         signer
       ]);
 
-      const call = { to: VAULT_ADDRESS, data, from: signer };
+      const callRequest = {
+        to: VAULT_ADDRESS,
+        data,
+        from: signer
+      };
 
-      try { await httpProvider.call(call); } catch {}
+      // simulate (safe)
+      try {
+        await httpProvider.call(callRequest);
+      } catch (e) {
+        // simulation error is okay—liquidity may be insufficient now
+      }
 
+      // estimate gas (best effort)
       let gasLimit;
       try {
-        const est = await httpProvider.estimateGas(call);
-        gasLimit = BigInt(Math.floor(Number(est) * 1.2));
+        const est = await httpProvider.estimateGas(callRequest);
+        gasLimit = BigInt(Math.floor(Number(est) * 1.25));
       } catch {
         gasLimit = 600000n;
       }
 
-      let gasPrice = await currentGasPriceOrFallback(gasGwei);
-      const cap = BigInt(Math.floor(gasGweiCap * 1e9));
+      // choose gas price
+      let gasPrice = await getSafeGasPrice(gasGwei);
+      const cap = BigInt(Math.floor(gasCap * 1e9));
       if (gasPrice > cap) gasPrice = cap;
 
-      const tx = { to: VAULT_ADDRESS, data, gasLimit, gasPrice };
+      const tx = {
+        to: VAULT_ADDRESS,
+        data,
+        gasLimit,
+        gasPrice
+      };
 
       if (dryRun) {
-        console.log("[DRY RUN] redeem tx prepared");
+        console.log(`[DRY RUN] Would send redeem tx with gasPrice ${gasPrice}`);
         return;
       }
 
       const sent = await wallet.sendTransaction(tx);
       console.log("Sent redeem tx:", sent.hash);
-      const receipt = await sent.wait(1);
 
-      if (receipt.status === 1n) {
-        console.log("Redeem successful:", receipt.transactionHash);
+      const rcpt = await sent.wait(1);
+      if (rcpt.status === 1n) {
+        console.log("Redeem SUCCESS:", rcpt.transactionHash);
         return;
       }
+
+      console.warn("Redeem failed (not reverted), retrying...");
+
     } catch (err) {
-      console.error("redeem error:", err.message);
+      console.warn(`Attempt #${attempt} error: ${err.message}`);
     }
 
-    const wait = retryBaseMs * Math.pow(1.8, attempt);
-    console.log(`Retry ${attempt}/${maxRetries}, wait ${wait}ms`);
-    await sleep(wait);
-    gasGwei = Math.min(gasGweiCap, Math.round(gasGwei * 1.6));
+    const delay = retryBaseMs * Math.pow(1.8, attempt);
+    console.log(`Retry ${attempt}/${maxRetries}, waiting ${delay}ms ...`);
+
+    await sleep(delay);
+    gasGwei = Math.min(gasCap, Math.round(gasGwei * 1.5));
   }
 
-  console.error("Redeem attempts exhausted.");
+  console.error("Max retries reached — rescue failed.");
 }
+
+// ---------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------
+(async function main() {
+  const signer = await wallet.getAddress();
+  console.log(`Running Rescue Bot for wallet: ${signer}`);
+  console.log(`Vault: ${VAULT_ADDRESS}`);
+
+  // --- Event listeners ---
+  vaultWs.on("Deposit", () => triggerRescue("Deposit"));
+  vaultWs.on("Withdraw", () => triggerRescue("Withdraw"));
+  vaultWs.on("Transfer", () => triggerRescue("Transfer"));
+
+  // initial rescue attempt
+  await triggerRescue("startup");
+})();
