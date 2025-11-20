@@ -27,7 +27,7 @@ Supports: **Any ERC‑4626 vault**, including the example vault on BNB Chain:
 
 ## 📦 Installation
 ```bash
-git clone https://github.com/YOUR_GITHUB/erc4626-rescue-bot
+git clone https://github.com/ahm3d69/erc4626-rescue-bot
 cd erc4626-rescue-bot
 npm install
 ```
@@ -129,6 +129,3 @@ A success is detected by:
 
 ## 📝 License
 MIT
-
-If you need a **Dockerfile**, **systemd runner**, or **TypeScript rewrite**, tell me and I will generate it!
-
