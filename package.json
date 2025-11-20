@@ -1,0 +1,13 @@
+{
+  "name": "erc4626-rescue-bot",
+  "version": "1.0.0",
+  "description": "Automatic ERC-4626 liquidity rescue bot",
+  "main": "rescue-bot.js",
+  "scripts": {
+    "start": "node rescue-bot.js"
+  },
+  "dependencies": {
+    "ethers": "^6.8.0",
+    "dotenv": "^16.0.0"
+  }
+}
