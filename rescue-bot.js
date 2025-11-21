@@ -1,5 +1,4 @@
-// Updated rescue-bot.js with Option A: redeem only available liquidity
-
+// rescue-bot.js with Event-Delta Redeem integrated
 import 'dotenv/config';
 import { ethers } from 'ethers';
 
@@ -42,9 +41,13 @@ const ERC4626_ABI = [
   "function redeem(uint256 shares, address receiver, address owner) external returns (uint256)",
   "function maxRedeem(address owner) view returns (uint256)",
   "function balanceOf(address owner) view returns (uint256)",
-  "function convertToShares(uint256 assets) view returns (uint256)",
-  "function convertToAssets(uint256 shares) view returns (uint256)",
   "function decimals() view returns (uint8)"
+];
+
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)"
 ];
 
 // ---------------------------------------------------------
@@ -53,12 +56,14 @@ const ERC4626_ABI = [
 const wsProvider = new ethers.WebSocketProvider(RPC_WS);
 const httpProvider = new ethers.JsonRpcProvider(RPC_HTTP);
 
-// wallet (signer)
 const wallet = new ethers.Wallet(PRIVATE_KEY, httpProvider);
 
-// Contracts
 const vault = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, httpProvider);
 const vaultWs = new ethers.Contract(VAULT_ADDRESS, ERC4626_ABI, wsProvider);
+
+const underlying = TOKEN_ADDRESS
+  ? new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, httpProvider)
+  : null;
 
 // ---------------------------------------------------------
 // Helpers
@@ -80,18 +85,72 @@ async function getSafeGasPrice(gweiPreferred) {
 }
 
 // ---------------------------------------------------------
-// Rescue Logic Option A: redeem exact available liquidity
+// Event-delta redeem
+// ---------------------------------------------------------
+async function redeemDelta(deltaAssets) {
+  const signer = await wallet.getAddress();
+
+  if (deltaAssets <= 0n) return;
+
+  try {
+    const sharesToBurn = deltaAssets; // assume 1:1 for low-liquidity rescue
+
+    const data = vault.interface.encodeFunctionData("redeem", [
+      sharesToBurn,
+      OWNER_ADDRESS,
+      signer
+    ]);
+
+    const callRequest = { to: VAULT_ADDRESS, data, from: signer };
+
+    try { await httpProvider.call(callRequest); } catch {}
+
+    let gasLimit;
+    try {
+      const est = await httpProvider.estimateGas(callRequest);
+      gasLimit = BigInt(Math.floor(Number(est) * 1.25));
+    } catch {
+      gasLimit = 400000n;
+    }
+
+    let gasPrice = await getSafeGasPrice(10);
+    const cap = BigInt(Math.floor(gasCap * 1e9));
+    if (gasPrice > cap) gasPrice = cap;
+
+    const tx = { to: VAULT_ADDRESS, data, gasLimit, gasPrice };
+
+    if (dryRun) {
+      console.log(`[DRY RUN] Event-delta redeem triggered: ${deltaAssets} assets`);
+      return;
+    }
+
+    const sent = await wallet.sendTransaction(tx);
+    console.log("Event-delta redeem tx sent:", sent.hash);
+    await sent.wait(1);
+    console.log("Event-delta redeem SUCCESS");
+
+  } catch (e) {
+    console.log("Event-delta redeem failed:", e.message);
+  }
+}
+
+// ---------------------------------------------------------
+// Traditional rescue loop
 // ---------------------------------------------------------
 let rescueRunning = false;
 let rescueReason = "startup";
 
 async function triggerRescue(reason) {
-  if (rescueRunning) return;
+  if (rescueRunning) {
+    rescueReason = reason;
+    return;
+  }
+
   rescueRunning = true;
   rescueReason = reason;
 
   try {
-    await rescueAvailableLiquidity();
+    await rescueLoop();
   } catch (e) {
     console.error("RESCUE ERROR:", e);
   } finally {
@@ -99,36 +158,35 @@ async function triggerRescue(reason) {
   }
 }
 
-async function rescueAvailableLiquidity() {
+async function rescueLoop() {
   const signer = await wallet.getAddress();
   console.log(`\n--- Rescue triggered by: ${rescueReason} ---`);
 
-  let maxShares;
+  let maxR;
   try {
-    maxShares = await vault.maxRedeem(signer);
+    maxR = await vault.maxRedeem(signer);
   } catch {
-    console.error("Cannot read maxRedeem");
+    console.error("Cannot read maxRedeem()");
     return;
   }
 
-  if (maxShares === 0n) {
+  if (maxR === 0n) {
     console.log("No liquidity available yet — waiting for next event");
     return;
   }
 
-  console.log(`Liquidity available! Trying redeem of ${maxShares.toString()} shares.`);
-
-  await attemptRedeem(maxShares);
+  console.log(`Redeeming available liquidity: ${maxR.toString()}`);
+  await attemptRedeemRepeated(maxR);
 }
 
-// ---------------------------------------------------------
-// Core redeem engine
-// ---------------------------------------------------------
-async function attemptRedeem(shares) {
+async function attemptRedeemRepeated(shares) {
   const signer = await wallet.getAddress();
+  let attempt = 0;
   let gasGwei = gasStart;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  while (attempt < maxRetries) {
+    attempt++;
+
     try {
       const data = vault.interface.encodeFunctionData("redeem", [
         shares,
@@ -145,7 +203,7 @@ async function attemptRedeem(shares) {
         const est = await httpProvider.estimateGas(callRequest);
         gasLimit = BigInt(Math.floor(Number(est) * 1.25));
       } catch {
-        gasLimit = 600000n;
+        gasLimit = 500000n;
       }
 
       let gasPrice = await getSafeGasPrice(gasGwei);
@@ -155,7 +213,7 @@ async function attemptRedeem(shares) {
       const tx = { to: VAULT_ADDRESS, data, gasLimit, gasPrice };
 
       if (dryRun) {
-        console.log(`[DRY RUN] Would redeem available shares: ${shares}`);
+        console.log(`[DRY RUN] Would send redeem tx with gasPrice ${gasPrice}`);
         return;
       }
 
@@ -168,8 +226,6 @@ async function attemptRedeem(shares) {
         return;
       }
 
-      console.warn("Redeem failed — retrying...");
-
     } catch (err) {
       console.warn(`Attempt #${attempt} error: ${err.message}`);
     }
@@ -180,22 +236,32 @@ async function attemptRedeem(shares) {
     gasGwei = Math.min(gasCap, Math.round(gasGwei * 1.5));
   }
 
-  console.error("Max retries reached — stopping rescue for this event.");
+  console.error("Max retries reached — giving up this cycle.");
 }
 
 // ---------------------------------------------------------
-// MAIN
+// MAIN + EVENT-DELTA LISTENERS
 // ---------------------------------------------------------
 (async function main() {
   const signer = await wallet.getAddress();
   console.log(`Running Rescue Bot for wallet: ${signer}`);
   console.log(`Vault: ${VAULT_ADDRESS}`);
 
-  // Event-driven rescue
-  vaultWs.on("Deposit", () => triggerRescue("Deposit"));
-  vaultWs.on("Transfer", () => triggerRescue("Transfer"));
-  vaultWs.on("Withdraw", () => triggerRescue("Withdraw"));
+  vaultWs.on("Deposit", async (caller, owner, assets, shares) => {
+    console.log("Deposit event detected — delta redeem", assets.toString());
+    await redeemDelta(assets);
+  });
 
-  // First attempt on startup
+  vaultWs.on("Transfer", async (from, to, value) => {
+    if (to.toLowerCase() === VAULT_ADDRESS.toLowerCase()) {
+      console.log("Inbound transfer detected — delta redeem", value.toString());
+      await redeemDelta(value);
+    }
+  });
+
+  vaultWs.on("Withdraw", async () => {
+    await triggerRescue("Withdraw");
+  });
+
   await triggerRescue("startup");
 })();
